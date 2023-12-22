@@ -14,6 +14,8 @@ from config import config
 import argparse
 import datetime
 import gc
+import queue
+import sys
 
 logging.getLogger("numba").setLevel(logging.WARNING)
 import commons
@@ -51,6 +53,34 @@ torch.backends.cuda.enable_mem_efficient_sdp(
 )  # Not available if torch version is lower than 2.0
 global_step = 0
 
+# 用于记录训练模型数据的变量
+
+# 用于记录epoch
+train_epoch_last = -1
+train_epoch_now = -1
+
+# 停止训练计数
+train_stop_counting = 0
+# 停止训练计数最大值 超过则停止训练 每次滑动窗口出现一次最低值递增1
+train_stop_counting_MAX = 50  # (可改)
+
+# 保存模型的平均得分(最大值200 得分越低模型越好)
+global_save_average = 100 # (初始值 训练过程中会改变)
+
+# 训练滑动窗口队列
+train_queue = queue.Queue()
+train_queue_MAX = 20  # (可改)
+
+# 模型得分队列
+save_queue = queue.Queue()
+save_queue_MAX = 8  # (由config.yml train_ms keep_ckpts决定)
+
+# 用于归一化的loss最大最小值
+loss_gen_MIN = 1.5  # (可根据日志修改)
+loss_gen_MAX = 4.0  # (可根据日志修改)
+
+loss_mel_MIN = 5.0  # (可根据日志修改)
+loss_mel_MAX = 30.0 # (可根据日志修改)
 
 def run():
     # 环境变量解析
@@ -392,6 +422,114 @@ def run():
             scheduler_dur_disc.step()
 
 
+# 计算得分 得分越低越好
+def calculate_score(loss_gen_vel, loss_mel_vel):
+    loss_gen_score = 1 # (赋个小的初值 避免异常)
+    loss_mel_score = 1
+
+    if loss_gen_vel > loss_gen_MIN:
+        loss_gen_score = (loss_gen_vel - loss_gen_MIN) / (loss_gen_MAX - loss_gen_MIN) * 100.0
+
+    if loss_mel_vel > loss_mel_MIN:
+        loss_mel_score = (loss_mel_vel - loss_mel_MIN) / (loss_mel_MAX - loss_mel_MIN) * 100.0
+
+    out_score = loss_gen_score + loss_mel_score
+    # print("loss_gen_vel:{} loss_mel_vel:{}".format(loss_gen_vel, loss_mel_vel))
+    # print("out_score:{} loss_gen_score:{} loss_mel_score:{}".format(out_score, loss_gen_score, loss_mel_score))
+    return out_score
+
+# 是否执行保存模型
+def save_it(loss_gen_vel, loss_mel_vel, global_step_vel, logger):
+    global train_queue
+    global save_queue
+    global train_stop_counting
+    global dataset_data_dir
+    global global_save_average
+
+    ret = False
+
+    # 队列是满时才进行保存计算 前train_queue_MAX不保存 前面训练时模型一般不好
+    if train_queue.qsize() == train_queue_MAX:
+        # 找到历史最低得分
+        queue_list = list(train_queue.queue)
+        train_queue_score = [calculate_score(gen_vel, mel_vel) for gen_vel, mel_vel in queue_list]
+        train_queue_score_min = min(train_queue_score)
+        # print(f"Queue   Min Vel: {train_queue_score_min}")
+
+        # 计算当前得分
+        current_score = calculate_score(loss_gen_vel, loss_mel_vel)
+
+        # 提取浮点数值并保存到 current_score_vel
+        current_score_vel = current_score.item()
+        logger.info("Current epoch score:{}".format(current_score_vel))
+
+        # 判断当前是否低于平均值 低于平均值则保存该模型
+        if current_score_vel < global_save_average:
+            logger.info("++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
+            logger.info("save model!!! global_step_vel:{} current_score_vel:{} < global_save_average:{}".format(global_step_vel, current_score_vel, global_save_average))
+            logger.info("save model!!! global_step_vel:{} loss_gen_vel:{} loss_mel_vel:{}".format(global_step_vel, loss_gen_vel, loss_mel_vel))
+            ret = True
+
+        # 判断当前得分是否低于队列最低分
+        if current_score_vel < train_queue_score_min:
+            logger.info("*****************************************************************************")
+            logger.info("global_step_vel:{} current_score_vel:{} < global_save_average:{}".format(global_step_vel, current_score_vel, train_queue_score_min))
+            
+            # 累计值递增
+            train_stop_counting += 1
+            logger.info("train_stop_counting:{} ".format(train_stop_counting))
+
+            # 当前保存模型队列未满 (在滑动队列最低分的前提下)
+            if save_queue.qsize() < save_queue_MAX:
+                logger.info("save model!!! save_queue size:{} ".format(train_stop_counting))
+                ret = True
+
+        # 保存模型标志为True
+        if ret:
+            # 清空计数
+            train_stop_counting = 0
+
+            # # 打印save_queue队列
+            # logger.info(f"1 save_queue: {list(save_queue.queue)}")
+
+            # 将新的值入队
+            save_queue.put(current_score_vel)
+
+            # 当队列大小等于save_MAX时删除最大值
+            if save_queue.qsize() > save_queue_MAX:
+                max_value = max(save_queue.queue)
+                items = []
+                while not save_queue.empty():
+                    item = save_queue.get()
+                    if item != max_value:
+                        items.append(item)
+                for item in items:
+                    save_queue.put(item)
+                logger.info("Removed max value:{}".format(max_value))
+
+            # 打印save_queue队列
+            logger.info(f"save_queue: {list(save_queue.queue)}")
+
+
+            # 计算队列的平均值
+            save_average = sum(save_queue.queue) / save_queue.qsize()
+            global_save_average = save_average
+            logger.info("global_save_average:{}".format(global_save_average))
+
+    # 将loss_gen_vel和loss_mel_vel插入队尾
+    train_queue.put((loss_gen_vel, loss_mel_vel))
+    # print("train_queue put loss_gen_vel:{} loss_mel_vel:{}".format(loss_gen_vel, loss_mel_vel))
+
+    # 当队列大小等于 train_queue_MAX 时删除队头
+    if train_queue.qsize() > train_queue_MAX:
+        train_queue.get()
+
+    # 打印队列
+    # print(f"Current Queue: {list(train_queue.queue)}")
+
+    return ret
+
+
 def train_and_evaluate(
     rank,
     local_rank,
@@ -607,8 +745,17 @@ def train_and_evaluate(
         scaler.step(optim_g)
         scaler.update()
 
+
+        global train_epoch_last
+        global train_epoch_now
+        global train_stop_counting
+
         if rank == 0:
-            if global_step % hps.train.log_interval == 0:
+            train_epoch_now = epoch
+            # if global_step % hps.train.log_interval == 0:
+            if train_epoch_now != train_epoch_last:
+                logger.info("Train Epoch: {}".format(epoch))
+                train_epoch_last = train_epoch_now
                 lr = optim_g.param_groups[0]["lr"]
                 losses = [loss_disc, loss_gen, loss_fm, loss_mel, loss_dur, loss_kl]
                 logger.info(
@@ -693,46 +840,51 @@ def train_and_evaluate(
                     scalars=scalar_dict,
                 )
 
-            if global_step % hps.train.eval_interval == 0:
-                evaluate(hps, net_g, eval_loader, writer_eval)
-                utils.save_checkpoint(
-                    net_g,
-                    optim_g,
-                    hps.train.learning_rate,
-                    epoch,
-                    os.path.join(hps.model_dir, "G_{}.pth".format(global_step)),
-                )
-                utils.save_checkpoint(
-                    net_d,
-                    optim_d,
-                    hps.train.learning_rate,
-                    epoch,
-                    os.path.join(hps.model_dir, "D_{}.pth".format(global_step)),
-                )
-                utils.save_checkpoint(
-                    net_wd,
-                    optim_wd,
-                    hps.train.learning_rate,
-                    epoch,
-                    os.path.join(hps.model_dir, "WD_{}.pth".format(global_step)),
-                )
-                if net_dur_disc is not None:
+                # if global_step % hps.train.eval_interval == 0:
+                if save_it(loss_gen, loss_mel, global_step, logger):
+                    evaluate(hps, net_g, eval_loader, writer_eval)
                     utils.save_checkpoint(
-                        net_dur_disc,
-                        optim_dur_disc,
+                        net_g,
+                        optim_g,
                         hps.train.learning_rate,
                         epoch,
-                        os.path.join(hps.model_dir, "DUR_{}.pth".format(global_step)),
+                        os.path.join(hps.model_dir, "G_{}.pth".format(global_step)),
                     )
-                keep_ckpts = config.train_ms_config.keep_ckpts
-                if keep_ckpts > 0:
-                    utils.clean_checkpoints(
-                        path_to_models=hps.model_dir,
-                        n_ckpts_to_keep=keep_ckpts,
-                        sort_by_time=True,
+                    utils.save_checkpoint(
+                        net_d,
+                        optim_d,
+                        hps.train.learning_rate,
+                        epoch,
+                        os.path.join(hps.model_dir, "D_{}.pth".format(global_step)),
                     )
+                    utils.save_checkpoint(
+                        net_wd,
+                        optim_wd,
+                        hps.train.learning_rate,
+                        epoch,
+                        os.path.join(hps.model_dir, "WD_{}.pth".format(global_step)),
+                    )
+                    if net_dur_disc is not None:
+                        utils.save_checkpoint(
+                            net_dur_disc,
+                            optim_dur_disc,
+                            hps.train.learning_rate,
+                            epoch,
+                            os.path.join(hps.model_dir, "DUR_{}.pth".format(global_step)),
+                        )
+                    keep_ckpts = config.train_ms_config.keep_ckpts
+                    if keep_ckpts > 0:
+                        utils.clean_checkpoints(
+                            path_to_models=hps.model_dir,
+                            n_ckpts_to_keep=keep_ckpts,
+                            sort_by_time=True,
+                        )
 
         global_step += 1
+
+        if train_stop_counting > train_stop_counting_MAX:
+            logger.info("exit! train_stop_counting:{} > stop_counting:{}".format(train_stop_counting, train_stop_counting_MAX))
+            sys.exit()  # 结束程序运行
 
     gc.collect()
     torch.cuda.empty_cache()
