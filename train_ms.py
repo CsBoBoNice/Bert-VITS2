@@ -65,7 +65,7 @@ train_stop_counting = 0
 train_stop_counting_MAX = 50  # (可改)
 
 # 保存模型的平均得分(最大值200 得分越低模型越好)
-global_save_average = 100 # (初始值 训练过程中会改变)
+global_save_average = 100.0 # (初始值 训练过程中会改变)
 
 # 训练滑动窗口队列
 train_queue = queue.Queue()
@@ -76,7 +76,7 @@ save_queue = queue.Queue()
 save_queue_MAX = 8  # (由config.yml train_ms keep_ckpts决定)
 
 # 用于归一化的loss最大最小值
-loss_gen_MIN = 1.5  # (可根据日志修改)
+loss_gen_MIN = 1.1  # (可根据日志修改)
 loss_gen_MAX = 4.0  # (可根据日志修改)
 
 loss_mel_MIN = 5.0  # (可根据日志修改)
@@ -450,6 +450,7 @@ def save_it(loss_gen_vel, loss_mel_vel, global_step_vel, logger):
 
     # 队列是满时才进行保存计算 前train_queue_MAX不保存 前面训练时模型一般不好
     if train_queue.qsize() == train_queue_MAX:
+    # if train_queue.qsize() > 1:
         # 找到历史最低得分
         queue_list = list(train_queue.queue)
         train_queue_score = [calculate_score(gen_vel, mel_vel) for gen_vel, mel_vel in queue_list]
@@ -473,7 +474,7 @@ def save_it(loss_gen_vel, loss_mel_vel, global_step_vel, logger):
         # 判断当前得分是否低于队列最低分
         if current_score_vel < train_queue_score_min:
             logger.info("*****************************************************************************")
-            logger.info("global_step_vel:{} current_score_vel:{} < global_save_average:{}".format(global_step_vel, current_score_vel, train_queue_score_min))
+            logger.info("global_step_vel:{} current_score_vel:{} < train_queue_score_min:{}".format(global_step_vel, current_score_vel, train_queue_score_min))
             
             # 累计值递增
             train_stop_counting += 1
