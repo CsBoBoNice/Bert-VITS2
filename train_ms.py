@@ -56,30 +56,35 @@ global_step = 0
 # 用于记录训练模型数据的变量
 
 # 用于记录epoch
-train_epoch_last = -1
-train_epoch_now = -1
+train_epoch_last = 0
+train_epoch_now = 0
+
+# 用于记录多少个epoch进行一次评估
+train_epoch_span = 5  # (可改)
+train_epoch_span_count = 0 
+
 
 # 停止训练计数
 train_stop_counting = 0
 # 停止训练计数最大值 超过则停止训练 每次滑动窗口出现一次最低值递增1
-train_stop_counting_MAX = 50  # (可改)
+train_stop_counting_MAX = 10  # (可改)
 
 # 保存模型的平均得分(最大值200 得分越低模型越好)
 global_save_average = 100.0 # (初始值 训练过程中会改变)
 
 # 训练滑动窗口队列
 train_queue = queue.Queue()
-train_queue_MAX = 20  # (可改)
+train_queue_MAX = 10  # (可改)
 
 # 模型得分队列
 save_queue = queue.Queue()
 save_queue_MAX = 8  # (由config.yml train_ms keep_ckpts决定)
 
 # 用于归一化的loss最大最小值
-loss_gen_MIN = 1.1  # (可根据日志修改)
+loss_gen_MIN = 1.5  # (可根据日志修改)
 loss_gen_MAX = 4.0  # (可根据日志修改)
 
-loss_mel_MIN = 5.0  # (可根据日志修改)
+loss_mel_MIN = 6.0  # (可根据日志修改)
 loss_mel_MAX = 30.0 # (可根据日志修改)
 
 def run():
@@ -750,13 +755,19 @@ def train_and_evaluate(
         global train_epoch_last
         global train_epoch_now
         global train_stop_counting
+        global train_epoch_span
+        global train_epoch_span_count
 
         if rank == 0:
             train_epoch_now = epoch
             # if global_step % hps.train.log_interval == 0:
             if train_epoch_now != train_epoch_last:
-                logger.info("Train Epoch: {}".format(epoch))
                 train_epoch_last = train_epoch_now
+                train_epoch_span_count += 1
+
+            if train_epoch_span_count >= train_epoch_span:
+                train_epoch_span_count = 0
+                logger.info("Train Epoch: {}".format(epoch))
                 lr = optim_g.param_groups[0]["lr"]
                 losses = [loss_disc, loss_gen, loss_fm, loss_mel, loss_dur, loss_kl]
                 logger.info(
